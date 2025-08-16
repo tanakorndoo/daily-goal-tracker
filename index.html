@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Goal Tracker — Goals/Subgoals + Daily Checklist (Notion Ready)</title>
+  <meta name="description" content="ตัวติดตามเป้าหมาย: เป้าหมายหลัก/ย่อย, รายวัน 3+ เช็คลิสต์, ปรับปรุงได้, สีเขียว/แดง, รายงานภาพรวม — ฝัง Notion ได้" />
+  <!-- Tailwind -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React 18 UMD + ReactDOM + Babel -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    html, body { height: 100%; }
+    body { margin: 0; }
+    .grid-day { grid-template-columns: repeat(7, minmax(0, 1fr)); }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-900">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useEffect, useMemo, useState } = React;
+
+    // ----------------- Storage (IndexedDB + fallback) -----------------
+    const DB_NAME = "goal-tracker-v3";
+    const STORE = "kv";
+    const KEY = "state";
+
+    function openDB() {
+      return new Promise((resolve, reject) => {
+        if (!('indexedDB' in window)) {
+          resolve(null); return;
+        }
+        const req = indexedDB.open(DB_NAME, 1);
+        req.onupgradeneeded = () => {
+          const db = req.result;
+          if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => resolve(null); // fallback silently
+      });
+    }
+    async function idbGet(key) {
+      const db = await openDB(); if (!db) return null;
+      return new Promise((resolve) => {
+        const tx = db.transaction(STORE, "readonly");
+        const st = tx.objectStore(STORE);
+        const rq = st.get(key);
+        rq.onsuccess = () => resolve(rq.result ?? null);
+        rq.onerror = () => resolve(null);
+      });
+    }
+    async function idbSet(key, val) {
+      const db = await openDB(); if (!db) return false;
+      return new Promise((resolve) => {
+        const tx = db.transaction(STORE, "readwrite");
+        const st = tx.objectStore(STORE);
+        const rq = st.put(val, key);
+        rq.onsuccess = () => resolve(true);
+        rq.onerror = () => resolve(false);
+      });
+    }
+
+    // ----------------- Helpers -----------------
+    const CATS = ["ความรู้", "สร้างผลงาน", "อื่นๆ"];
+    function rid() { try { return crypto.getRandomValues(new Uint32Array(1))[0].toString(36); } catch { return Math.random().toString(36).slice(2); } }
+    function todayISO() { return new Date().toISOString().slice(0,10); }
+    function fmtThai(iso) {
+      const d = new Date(iso); if (isNaN(d)) return iso;
+      const dd = String(d.getDate()).padStart(2, "0");
+      const mm = String(d.getMonth()+1).padStart(2, "0");
+      const by = d.getFullYear()+543; const yy = String(by).slice(-2);
+      return `${dd}/${mm}/${yy} (พ.ศ. ${by})`;
+    }
+
+    // ----------------- Data Types (informal) -----------------
+    // state = { goals: MainGoal[], days: Record<iso, DayRecord> }
+    // MainGoal { id, title, color?, subgoals: SubGoal[] }
+    // SubGoal { id, title, doneManual:boolean }
+    // DayRecord { date, tasks: Task[] }
+    // Task { id, title, category, success, note, mainGoalId?, subGoalId? }
+
+    // ----------------- Seed Sample -----------------
+    const seed = (() => {
+      const g1 = { id: rid(), title: "ทำ Ebook", color: "#0ea5e9", subgoals: [
+        { id: rid(), title: "เขียนบทที่ 1", doneManual: false },
+        { id: rid(), title: "เขียนบทที่ 2", doneManual: false },
+        { id: rid(), title: "ออกแบบปก",   doneManual: false },
+      ]};
+      const g2 = { id: rid(), title: "พัฒนาความรู้", color: "#10b981", subgoals: [
+        { id: rid(), title: "เรียน n8n", doneManual: false },
+        { id: rid(), title: "อ่านหนังสือ", doneManual: false },
+      ]};
+      const mapSub = Object.fromEntries([g1, g2].flatMap(g => g.subgoals.map(s => [s.id, s])));
+      const mapMain = Object.fromEntries([[g1.id, g1],[g2.id,g2]]);
+      const d1 = "2025-08-15"; const d2 = "2025-08-16";
+      const days = {
+        [d1]: { date: d1, tasks: [
+          { id: rid(), title: "ทำ Ebook", category: "สร้างผลงาน", success: true,  note: "ร่างสารบัญและเขียนบทที่ 1", mainGoalId: g1.id, subGoalId: g1.subgoals[0].id },
+          { id: rid(), title: "เรียน n8n", category: "ความรู้", success: false, note: "", mainGoalId: g2.id, subGoalId: g2.subgoals[0].id },
+          { id: rid(), title: "อ่านหนังสือ", category: "ความรู้", success: false, note: "", mainGoalId: g2.id, subGoalId: g2.subgoals[1].id },
+        ]},
+        [d2]: { date: d2, tasks: [
+          { id: rid(), title: "ทำ Ebook", category: "สร้างผลงาน", success: true, note: "แก้บทที่ 2", mainGoalId: g1.id, subGoalId: g1.subgoals[1].id },
+          { id: rid(), title: "เรียน n8n", category: "ความรู้", success: true, note: "ต่อ API สำเร็จ", mainGoalId: g2.id, subGoalId: g2.subgoals[0].id },
+          { id: rid(), title: "อ่านหนังสือ", category: "ความรู้", success: true, note: "30 หน้า", mainGoalId: g2.id, subGoalId: g2.subgoals[1].id },
+        ]},
+      };
+      return { goals: [g1, g2], days };
+    })();
+
+    // Ensure at least 3 tasks per day
+    function ensure3(day) {
+      const d = day ?? { date: todayISO(), tasks: [] };
+      const t = (d.tasks ?? []).slice();
+      while (t.length < 3) t.push({ id: rid(), title: "", category: "อื่นๆ", success: false, note: "", mainGoalId: "", subGoalId: "" });
+      return { ...d, tasks: t };
+    }
+
+    // ----------------- Stats -----------------
+    function indexGoals(goals) {
+      const gById = {}; const sById = {};
+      goals.forEach(g => {
+        gById[g.id] = g;
+        g.subgoals.forEach(s => { sById[s.id] = { ...s, mainId: g.id }; });
+      });
+      return { gById, sById };
+    }
+    function subgoalStats(state, subId) {
+      const { sById } = indexGoals(state.goals);
+      const s = sById[subId]; if (!s) return { ok:0, total:0, pct:0, done:false };
+      let ok=0,total=0;
+      Object.values(state.days).forEach(d => d.tasks.forEach(t => {
+        if (t.subGoalId === subId) { total++; if (t.success) ok++; }
+      }));
+      const pct = total ? Math.round((ok/total)*100) : 0;
+      const done = s.doneManual || (total>0 && pct===100);
+      return { ok, total, pct, done };
+    }
+    function mainGoalStats(state, mainId) {
+      const g = state.goals.find(g=>g.id===mainId);
+      if (!g) return { pct:0, done:false };
+      if (g.subgoals.length===0) return { pct:0, done:false };
+      let sumPct = 0; let allDone = true;
+      g.subgoals.forEach(s => {
+        const st = subgoalStats(state, s.id);
+        sumPct += st.pct;
+        if (!st.done) allDone = false;
+      });
+      const pct = Math.round(sumPct / Math.max(1,g.subgoals.length));
+      return { pct, done: allDone };
+    }
+
+    // ----------------- Components -----------------
+    function Progress({ value }) {
+      const v = Math.min(100, Math.max(0, Number(value)||0));
+      return (
+        <div className="h-2 w-full rounded-full bg-slate-200">
+          <div className="h-2 rounded-full bg-emerald-500" style={{ width: `${v}%` }} />
+        </div>
+      );
+    }
+    function StatCard({ title, value, hint }) {
+      return (
+        <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div className="text-xs text-slate-500">{title}</div>
+          <div className="mt-1 text-2xl font-semibold">{value}</div>
+          {hint ? <div className="mt-1 text-xs text-slate-500">{hint}</div> : null}
+        </div>
+      );
+    }
+
+    // Calendar grid
+    function MonthGrid({ currentISO, onPick }) {
+      const base = new Date(currentISO);
+      const year = base.getFullYear(); const month = base.getMonth();
+      const first = new Date(year, month, 1);
+      const start = new Date(first); start.setDate(1 - ((first.getDay()+6)%7)); // Monday first
+      const cells = [];
+      for (let i=0;i<42;i++){ const d = new Date(start); d.setDate(start.getDate()+i); cells.push(d); }
+      const curMonth = month;
+      function toISO(d){ return d.toISOString().slice(0,10); }
+      return (
+        <div className="grid grid-day gap-2">
+          {["จ", "อ", "พ", "พฤ", "ศ", "ส", "อา"].map(w => <div key={w} className="text-center text-xs text-slate-500">{w}</div>)}
+          {cells.map((d,i)=>{
+            const inMonth = d.getMonth() === curMonth;
+            const cls = inMonth ? "bg-white" : "bg-slate-100 text-slate-400";
+            return (
+              <button key={i} onClick={()=>onPick(toISO(d))} className={`rounded-xl border border-slate-200 p-2 text-left ${cls} hover:bg-slate-50`}>
+                <div className="text-xs">{d.getDate()}</div>
+              </button>
+            );
+          })}
+        </div>
+      );
+    }
+
+    // ----------------- App -----------------
+    function App() {
+      const [state, setState] = useState(() => {
+        try { const r = localStorage.getItem("GT_V3_CACHE"); if (r) return JSON.parse(r); } catch {}
+        return seed;
+      });
+      const [tab, setTab] = useState("daily"); // daily | calendar | goals | report
+      const [selectedDate, setSelectedDate] = useState(() => {
+        const t = new Date().toISOString().slice(0,10);
+        return state.days[t] ? t : (Object.keys(state.days).sort().pop() || t);
+      });
+      const [dateFilter, setDateFilter] = useState("all");
+      const [savedBlink, setSavedBlink] = useState(false);
+
+      // Load from IndexedDB
+      useEffect(()=>{ (async ()=>{
+        const d = await idbGet(KEY);
+        if (d) { setState(d); if (d.days[new Date().toISOString().slice(0,10)]) setSelectedDate(new Date().toISOString().slice(0,10)); }
+      })(); }, []);
+
+      // Persist
+      useEffect(()=>{
+        (async ()=>{ await idbSet(KEY, state); })();
+        try { localStorage.setItem("GT_V3_CACHE", JSON.stringify(state)); } catch {}
+        setSavedBlink(true);
+        const t = setTimeout(()=>setSavedBlink(false), 800);
+        return ()=>clearTimeout(t);
+      }, [state]);
+
+      // Index
+      const { gById, sById } = useMemo(()=>{
+        const gById = {}; const sById = {};
+        state.goals.forEach(g => { gById[g.id]=g; g.subgoals.forEach(s => { sById[s.id] = { ...s, mainId:g.id }; }); });
+        return { gById, sById };
+      }, [state.goals]);
+
+      // Days ops
+      const current = (()=>{
+        const d = state.days[selectedDate] || { date:selectedDate, tasks:[] };
+        return ensure3(d);
+      })();
+      function setDay(dateISO, newDay) {
+        setState(prev => ({ ...prev, days: { ...prev.days, [dateISO]: ensure3(newDay) } }));
+      }
+      function updateTask(i, patch) {
+        setDay(selectedDate, { ...current, tasks: current.tasks.map((t,idx)=> idx===i?{...t,...patch}:t) });
+      }
+      function addTask() { setDay(selectedDate, { ...current, tasks: [...current.tasks, { id: rid(), title:"", category:"อื่นๆ", success:false, note:"", mainGoalId:"", subGoalId:"" }] }); }
+      function removeTask(i) { if (current.tasks.length<=3) return; setDay(selectedDate, { ...current, tasks: current.tasks.filter((_,idx)=>idx!==i) }); }
+      function addDate(iso) {
+        setSelectedDate(iso);
+        if (!state.days[iso]) setState(prev => ({ ...prev, days: { ...prev.days, [iso]: ensure3({ date: iso, tasks: [] }) } }));
+      }
+
+      const filteredDateList = useMemo(()=>{
+        const list = Object.values(state.days).sort((a,b)=>a.date.localeCompare(b.date));
+        return list.filter(d=>{
+          const total = Math.max(1, d.tasks.length);
+          const ok = d.tasks.filter(t=>t.success).length;
+          const allOk = ok===total;
+          if (dateFilter==="perfect") return allOk;
+          if (dateFilter==="hasFail") return !allOk;
+          return true;
+        });
+      }, [state.days, dateFilter]);
+
+      // Goals ops
+      function addMainGoal() {
+        const title = prompt("ชื่อเป้าหมายหลัก"); if(!title) return;
+        const color = prompt("สีหลัก (hex เช่น #0ea5e9) - เว้นว่างได้") || "";
+        setState(prev => ({ ...prev, goals: [...prev.goals, { id: rid(), title, color, subgoals: [] }] }));
+      }
+      function editMainGoal(id) {
+        const g = state.goals.find(x=>x.id===id); if(!g) return;
+        const title = prompt("แก้ชื่อเป้าหมายหลัก", g.title); if(!title) return;
+        const color = prompt("แก้สี (hex) หรือเว้นว่าง", g.color||"") || "";
+        setState(prev => ({ ...prev, goals: prev.goals.map(x=> x.id===id?{...x, title, color}:x) }));
+      }
+      function removeMainGoal(id) {
+        if (!confirm("ลบเป้าหมายหลักนี้และย้ายเชื่อมโยงในรายการรายวันเป็นว่าง?")) return;
+        setState(prev => {
+          const days = Object.fromEntries(Object.entries(prev.days).map(([k,d])=>{
+            const tasks = d.tasks.map(t => t.mainGoalId===id ? { ...t, mainGoalId:"", subGoalId: "" } : t);
+            return [k, { ...d, tasks }];
+          }));
+          const goals = prev.goals.filter(g=>g.id!==id);
+          return { ...prev, goals, days };
+        });
+      }
+      function addSubGoal(mainId) {
+        const title = prompt("ชื่อเป้าหมายย่อย"); if(!title) return;
+        setState(prev => ({ ...prev, goals: prev.goals.map(g=> g.id===mainId ? { ...g, subgoals: [...g.subgoals, { id: rid(), title, doneManual:false }] } : g) }));
+      }
+      function editSubGoal(mainId, subId) {
+        const g = state.goals.find(x=>x.id===mainId); if(!g) return;
+        const s = g.subgoals.find(x=>x.id===subId); if(!s) return;
+        const title = prompt("แก้ชื่อเป้าหมายย่อย", s.title); if(!title) return;
+        setState(prev => ({ ...prev, goals: prev.goals.map(gg => gg.id===mainId ? { ...gg, subgoals: gg.subgoals.map(ss => ss.id===subId ? { ...ss, title } : ss) } : gg) }));
+      }
+      function toggleSubDone(mainId, subId) {
+        setState(prev => ({ ...prev, goals: prev.goals.map(gg => gg.id===mainId ? { ...gg, subgoals: gg.subgoals.map(ss => ss.id===subId ? { ...ss, doneManual: !ss.doneManual } : ss) } : gg) }));
+      }
+      function removeSubGoal(mainId, subId) {
+        if (!confirm("ลบเป้าหมายย่อยนี้และย้ายเชื่อมโยงในเช็คลิสต์เป็นว่าง?")) return;
+        setState(prev => {
+          const goals = prev.goals.map(g=> g.id===mainId ? { ...g, subgoals: g.subgoals.filter(s=>s.id!==subId) } : g);
+          const days = Object.fromEntries(Object.entries(prev.days).map(([k,d])=>{
+            const tasks = d.tasks.map(t => t.subGoalId===subId ? { ...t, subGoalId:"" } : t);
+            return [k, { ...d, tasks }];
+          }));
+          return { ...prev, goals, days };
+        });
+      }
+
+      // Stats
+      const allTasks = useMemo(()=>Object.values(state.days).flatMap(d=>d.tasks), [state.days]);
+      const OK = allTasks.filter(t=>t.success).length;
+      const TOT = allTasks.length || 1;
+      const PCT = Math.round((OK/TOT)*100);
+      const perDay = useMemo(()=> Object.values(state.days).sort((a,b)=>a.date.localeCompare(b.date)).map(d=>{
+        const ok=d.tasks.filter(t=>t.success).length;
+        const total=Math.max(1,d.tasks.length); return { date:d.date, ok, total, pct:Math.round((ok/total)*100) };
+      }), [state.days]);
+      function subgoalStats(state, subId) {
+        const gmap = {}; state.goals.forEach(g=>g.subgoals.forEach(s=>gmap[s.id]=g.id));
+        let ok=0,total=0; Object.values(state.days).forEach(d=>d.tasks.forEach(t=>{ if(t.subGoalId===subId){ total++; if(t.success) ok++; } }));
+        const pct = total?Math.round(ok/total*100):0; const done = (total>0 && pct===100) || state.goals.some(g=>g.subgoals.some(s=>s.id===subId && s.doneManual));
+        return { ok,total,pct,done };
+      }
+      function mainGoalStats(state, mainId) {
+        const g = state.goals.find(g=>g.id===mainId); if(!g) return { pct:0, done:false };
+        if(g.subgoals.length===0) return { pct:0, done:false };
+        let sum=0; let allDone=true;
+        g.subgoals.forEach(s=>{ const st=subgoalStats(state,s.id); sum+=st.pct; if(!st.done) allDone=false; });
+        return { pct:Math.round(sum/Math.max(1,g.subgoals.length)), done:allDone };
+      }
+
+      return (
+        <div className="min-h-screen w-full">
+          <header className="sticky top-0 z-10 border-b border-slate-200 bg-white/70 backdrop-blur">
+            <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-3">
+              <div className="flex items-center gap-3">
+                <span className="inline-flex h-8 w-8 items-center justify-center rounded-2xl bg-slate-900 text-white">G</span>
+                <h1 className="text-lg font-semibold">ตัวติดตามเป้าหมาย: เป้าหมายหลัก/ย่อย + รายวัน</h1>
+                {savedBlink ? <span className="ml-2 text-xs text-emerald-600">บันทึกแล้ว</span> : null}
+              </div>
+              <div className="flex items-center gap-2 text-sm">
+                {["daily","calendar","goals","report"].map(t => (
+                  <button key={t} onClick={()=>setTab(t)} className={`rounded-xl px-3 py-1.5 ${tab===t? "bg-slate-900 text-white":"bg-slate-100"}`}>
+                    {t==="daily"?"รายวัน":t==="calendar"?"ปฏิทิน":t==="goals"?"เป้าหมาย":"รายงาน"}
+                  </button>
+                ))}
+                <div className="ml-3 hidden items-center gap-2 sm:flex">
+                  <button onClick={()=>{
+                    const blob = new Blob([JSON.stringify(state,null,2)], { type:"application/json" });
+                    const url = URL.createObjectURL(blob); const a = document.createElement("a");
+                    a.href = url; a.download = "goal_tracker_backup.json"; a.click(); URL.revokeObjectURL(url);
+                  }} className="rounded-xl bg-slate-200 px-3 py-1.5 hover:bg-slate-300">ส่งออก JSON</button>
+                  <label className="rounded-xl bg-slate-200 px-3 py-1.5 hover:bg-slate-300 cursor-pointer">
+                    นำเข้า JSON
+                    <input type="file" accept="application/json" className="hidden" onChange={(ev)=>{
+                      const f = ev.target.files?.[0]; if(!f) return;
+                      const r = new FileReader(); r.onload = () => { try { const data = JSON.parse(String(r.result)); setState(data); } catch { alert("ไฟล์ไม่ถูกต้อง"); } };
+                      r.readAsText(f); ev.target.value = "";
+                    }} />
+                  </label>
+                  <button onClick={()=>{ if(confirm("ล้างข้อมูลทั้งหมด?")) setState({ goals:[], days:{} }); }} className="rounded-xl bg-rose-600 px-3 py-1.5 text-white hover:bg-rose-700">ล้างข้อมูล</button>
+                </div>
+              </div>
+            </div>
+          </header>
+
+          <main className="mx-auto grid max-w-7xl grid-cols-1 gap-4 p-4 md:grid-cols-[320px,1fr]">
+            <aside className="rounded-2xl border border-slate-200 bg-white p-3">
+              <div className="mb-3 flex items-center justify-between">
+                <h2 className="text-base font-semibold">วันทั้งหมด</h2>
+                <div className="flex gap-2">
+                  <button onClick={()=>addDate(new Date().toISOString().slice(0,10))} className="rounded-lg bg-emerald-600 px-2.5 py-1 text-xs text-white hover:bg-emerald-700">วันนี้</button>
+                  <button onClick={()=>{ const iso=prompt("YYYY-MM-DD", new Date().toISOString().slice(0,10)); if(iso){ addDate(iso); } }} className="rounded-lg bg-slate-200 px-2.5 py-1 text-xs hover:bg-slate-300">กำหนดเอง</button>
+                </div>
+              </div>
+              <div className="mb-3 grid grid-cols-3 gap-2 text-xs">
+                <button onClick={()=>setDateFilter("all")} className={`rounded-lg px-2 py-1 ${dateFilter==="all"?"bg-slate-900 text-white":"bg-slate-100"}`}>ทั้งหมด</button>
+                <button onClick={()=>setDateFilter("perfect")} className={`rounded-lg px-2 py-1 ${dateFilter==="perfect"?"bg-slate-900 text-white":"bg-slate-100"}`}>สำเร็จ 100%</button>
+                <button onClick={()=>setDateFilter("hasFail")} className={`rounded-lg px-2 py-1 ${dateFilter==="hasFail"?"bg-slate-900 text-white":"bg-slate-100"}`}>มีไม่สำเร็จ</button>
+              </div>
+              <div className="max-h-[55vh] overflow-auto pr-1">
+                {filteredDateList.length===0? <div className="rounded-xl bg-slate-50 p-3 text-center text-sm text-slate-500">ยังไม่มีข้อมูล</div> : null}
+                <ul className="space-y-2">
+                  {filteredDateList.map(d=>{
+                    const total=Math.max(1,d.tasks.length);
+                    const ok=d.tasks.filter(t=>t.success).length;
+                    const pct=Math.round((ok/total)*100);
+                    const isSel=d.date===selectedDate;
+                    return (
+                      <li key={d.date}>
+                        <button onClick={()=>{ setSelectedDate(d.date); setTab("daily"); }} className={`w-full rounded-xl border px-3 py-2 text-left ${isSel?"border-slate-900 bg-slate-900/5":"border-slate-200 hover:bg-slate-50"}`}>
+                          <div className="flex items-center justify-between">
+                            <span className="text-sm font-medium">{fmtThai(d.date)}</span>
+                            <span className={`rounded-lg px-2 py-0.5 text-xs ${pct===100?"bg-emerald-100 text-emerald-700":"bg-rose-100 text-rose-700"}`}>{pct}%</span>
+                          </div>
+                          <div className="mt-1 text-[11px] text-slate-600">สำเร็จ {ok}/{total} รายการ</div>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            </aside>
+
+            <section className="space-y-4">
+              {/* DAILY */}
+              {tab==="daily" && (
+                <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <h2 className="text-lg font-semibold">{fmtThai(selectedDate)}</h2>
+                      <p className="text-sm text-slate-600">เช็คลิสต์อย่างน้อย 3 รายการ — เลือกเป้าหมายหลัก/ย่อยให้แต่ละรายการได้</p>
+                    </div>
+                    <div className="flex items-center gap-2 text-sm">
+                      <input type="date" value={selectedDate} onChange={e=>addDate(e.target.value)} className="rounded-xl border border-slate-300 px-3 py-1.5" />
+                      <button onClick={()=>setDay(selectedDate, { ...current, tasks: current.tasks.map(t=>({ ...t, success:true })) })} className="rounded-xl bg-emerald-600 px-3 py-1.5 text-white hover:bg-emerald-700">ทำครบทั้งหมด</button>
+                      <button onClick={()=>addTask()} className="rounded-xl bg-slate-900 px-3 py-1.5 text-white hover:bg-black/80">+ เพิ่มภารกิจ</button>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                    {current.tasks.map((t,i)=>{
+                      const bg = t.success ? "bg-emerald-50 border-emerald-300" : "bg-rose-50 border-rose-300";
+                      const canRemove = current.tasks.length>3;
+                      const subsOfMain = t.mainGoalId ? (state.goals.find(g=>g.id===t.mainGoalId)?.subgoals || []) : [];
+                      return (
+                        <div key={t.id} className={`rounded-2xl border p-3 ${bg}`}>
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-sm font-medium">ภารกิจ #{i+1}</span>
+                            <div className="flex items-center gap-2">
+                              <button onClick={()=>updateTask(i,{ success:!t.success })} className={`rounded-xl px-2.5 py-1 text-xs ${t.success?"bg-emerald-600 text-white hover:bg-emerald-700":"bg-rose-600 text-white hover:bg-rose-700"}`}>{t.success?"สำเร็จ":"ไม่สำเร็จ"}</button>
+                              <button onClick={()=>canRemove && removeTask(i)} disabled={!canRemove} title={canRemove?"ลบภารกิจนี้":"ต้องมีอย่างน้อย 3 ภารกิจ"} className={`rounded-xl px-2.5 py-1 text-xs ${canRemove?"bg-slate-200 hover:bg-slate-300":"bg-slate-100 text-slate-400"}`}>ลบ</button>
+                            </div>
+                          </div>
+                          <label className="mt-2 block text-xs text-slate-600">ชื่อภารกิจ</label>
+                          <input value={t.title} onChange={e=>updateTask(i,{ title:e.target.value })} placeholder="เช่น ทำ Ebook / เรียน n8n / อ่านหนังสือ" className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm" />
+                          <label className="mt-2 block text-xs text-slate-600">ประเภทงาน</label>
+                          <select value={t.category} onChange={e=>updateTask(i,{ category:e.target.value })} className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm">
+                            {CATS.map(c=><option key={c} value={c}>{c}</option>)}
+                          </select>
+                          <label className="mt-2 block text-xs text-slate-600">ผูกกับเป้าหมายหลัก</label>
+                          <select value={t.mainGoalId} onChange={e=>updateTask(i,{ mainGoalId:e.target.value, subGoalId:"" })} className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm">
+                            <option value="">— ไม่ระบุ —</option>
+                            {state.goals.map(g=><option key={g.id} value={g.id}>{g.title}</option>)}
+                          </select>
+                          <label className="mt-2 block text-xs text-slate-600">ผูกกับเป้าหมายย่อย</label>
+                          <select value={t.subGoalId} onChange={e=>updateTask(i,{ subGoalId:e.target.value })} className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm">
+                            <option value="">— ไม่ระบุ —</option>
+                            {subsOfMain.map(s=><option key={s.id} value={s.id}>{s.title}</option>)}
+                          </select>
+                          <label className="mt-2 block text-xs text-slate-600">บันทึกว่าทำสำเร็จอย่างไร</label>
+                          <textarea value={t.note} onChange={e=>updateTask(i,{ note:e.target.value })} rows="4" placeholder={t.success?"อธิบายสั้น ๆ ว่าทำสำเร็จอย่างไร":"ถ้ายังไม่สำเร็จให้บันทึกอุปสรรค"} className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm" />
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* CALENDAR */}
+              {tab==="calendar" && (
+                <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                  <div className="mb-3 flex items-center justify-between">
+                    <h2 className="text-lg font-semibold">ปฏิทิน</h2>
+                    <div className="flex items-center gap-2">
+                      <button onClick={()=>{ const d=new Date(selectedDate); d.setMonth(d.getMonth()-1); setSelectedDate(d.toISOString().slice(0,10)); }} className="rounded-xl bg-slate-200 px-2 py-1 hover:bg-slate-300">‹</button>
+                      <div className="text-sm">{new Date(selectedDate).toLocaleString("th-TH",{month:"long", year:"numeric"})}</div>
+                      <button onClick={()=>{ const d=new Date(selectedDate); d.setMonth(d.getMonth()+1); setSelectedDate(d.toISOString().slice(0,10)); }} className="rounded-xl bg-slate-200 px-2 py-1 hover:bg-slate-300">›</button>
+                    </div>
+                  </div>
+                  <MonthGrid currentISO={selectedDate} onPick={(iso)=>{ addDate(iso); setTab("daily"); }} />
+                </div>
+              )}
+
+              {/* GOALS */}
+              {tab==="goals" && (
+                <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                  <div className="mb-3 flex items-center justify-between">
+                    <h2 className="text-lg font-semibold">จัดการเป้าหมาย</h2>
+                    <button onClick={()=>addMainGoal()} className="rounded-xl bg-slate-900 px-3 py-1.5 text-white hover:bg-black/80">+ เพิ่มเป้าหมายหลัก</button>
+                  </div>
+                  <div className="space-y-4">
+                    {state.goals.length===0 && <div className="rounded-xl bg-slate-50 p-3 text-sm text-slate-500">ยังไม่มีเป้าหมายหลัก เพิ่มใหม่ได้เลย</div>}
+                    {state.goals.map(g=>{
+                      const gStat = mainGoalStats(state, g.id);
+                      return (
+                        <div key={g.id} className="rounded-2xl border border-slate-200 bg-white p-3">
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-2">
+                              <div className="h-3 w-3 rounded" style={{background:g.color||"#94a3b8"}} />
+                              <div className="text-sm font-medium">{g.title}</div>
+                            </div>
+                            <div className="flex items-center gap-2 text-xs">
+                              <span className={`rounded-lg px-2 py-0.5 ${gStat.done?"bg-emerald-100 text-emerald-700":"bg-rose-100 text-rose-700"}`}>{gStat.pct}%</span>
+                              <button onClick={()=>editMainGoal(g.id)} className="rounded-lg bg-slate-200 px-2 py-1 hover:bg-slate-300">แก้ไข</button>
+                              <button onClick={()=>removeMainGoal(g.id)} className="rounded-lg bg-rose-600 px-2 py-1 text-white hover:bg-rose-700">ลบ</button>
+                            </div>
+                          </div>
+                          <div className="mt-2"><Progress value={gStat.pct} /></div>
+                          <div className="mt-3 rounded-xl border border-slate-200 p-3">
+                            <div className="mb-2 flex items-center justify-between">
+                              <div className="text-xs text-slate-600">เป้าหมายย่อย</div>
+                              <button onClick={()=>addSubGoal(g.id)} className="rounded-lg bg-slate-200 px-2 py-1 text-xs hover:bg-slate-300">+ เพิ่มเป้าหมายย่อย</button>
+                            </div>
+                            <div className="grid gap-2 md:grid-cols-2">
+                              {g.subgoals.length===0 && <div className="rounded-lg bg-slate-50 p-2 text-xs text-slate-500">ยังไม่มีเป้าหมายย่อย</div>}
+                              {g.subgoals.map(s=>{
+                                // recompute stats in this scope
+                                let ok=0,total=0; Object.values(state.days).forEach(d=>d.tasks.forEach(t=>{ if(t.subGoalId===s.id){ total++; if(t.success) ok++; } }));
+                                const pct = total?Math.round(ok/total*100):0; const done = (total>0 && pct===100) || s.doneManual;
+                                const green = done;
+                                return (
+                                  <div key={s.id} className={`rounded-xl border p-2 ${green?"bg-emerald-50 border-emerald-300":"bg-rose-50 border-rose-300"}`}>
+                                    <div className="flex items-center justify-between gap-2">
+                                      <div className="text-sm">{s.title}</div>
+                                      <div className="flex items-center gap-2 text-xs">
+                                        <span className={`rounded-lg px-2 py-0.5 ${green?"bg-emerald-100 text-emerald-700":"bg-rose-100 text-rose-700"}`}>{pct}%</span>
+                                        <button onClick={()=>toggleSubDone(g.id, s.id)} className={`rounded-lg px-2 py-1 ${s.doneManual?"bg-emerald-600 text-white hover:bg-emerald-700":"bg-slate-200 hover:bg-slate-300"}`}>{s.doneManual?"ทำสำเร็จแล้ว":"ทำสำเร็จ (ติ๊กมือ)"}</button>
+                                        <button onClick={()=>editSubGoal(g.id, s.id)} className="rounded-lg bg-slate-200 px-2 py-1 hover:bg-slate-300">แก้ไข</button>
+                                        <button onClick={()=>removeSubGoal(g.id, s.id)} className="rounded-lg bg-rose-600 px-2 py-1 text-white hover:bg-rose-700">ลบ</button>
+                                      </div>
+                                    </div>
+                                    <div className="mt-1"><Progress value={pct} /></div>
+                                    <div className="mt-1 text-[11px] text-slate-600">เชื่อมโยงสำเร็จ {ok}/{total} รายการรายวัน</div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* REPORT */}
+              {tab==="report" && (
+                <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                  <h2 className="text-lg font-semibold">รายงานภาพรวม</h2>
+                  <p className="text-sm text-slate-600">สรุปเปอร์เซ็นต์ทั้งหมด + ตามเป้าหมายหลัก/ย่อย</p>
+                  <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                    <StatCard title="เปอร์เซ็นต์สำเร็จรวม" value={`${PCT}%`} hint={`${OK}/${TOT} ภารกิจ`} />
+                    <StatCard title="จำนวนวันทั้งหมด" value={`${Object.keys(state.days).length}`} hint={`${perDay.filter(d=>d.pct===100).length} วันสำเร็จ 100%`} />
+                    <StatCard title="วันล่าสุดที่มีบันทึก" value={Object.keys(state.days).length ? fmtThai(Object.keys(state.days).sort().pop()) : "-"} hint={"ข้อมูลเก็บในอุปกรณ์ของคุณ"} />
+                  </div>
+
+                  <div className="mt-6">
+                    <h3 className="text-base font-semibold">สรุปตามเป้าหมายหลัก</h3>
+                    <div className="mt-2 grid gap-3 md:grid-cols-2">
+                      {state.goals.map(g=>{
+                        // main goal stats
+                        let sum=0; let cnt=Math.max(1,g.subgoals.length); let all=true;
+                        g.subgoals.forEach(s=>{
+                          let ok=0,total=0; Object.values(state.days).forEach(d=>d.tasks.forEach(t=>{ if(t.subGoalId===s.id){ total++; if(t.success) ok++; } }));
+                          const pct = total?Math.round(ok/total*100):0; if(pct<100 && !s.doneManual) all=false; sum+=pct;
+                        });
+                        const pct = Math.round(sum/cnt); const done = all;
+                        return (
+                          <div key={g.id} className="rounded-2xl border border-slate-200 p-3">
+                            <div className="flex items-center justify-between text-sm">
+                              <div className="flex items-center gap-2">
+                                <div className="h-3 w-3 rounded" style={{background:g.color||"#94a3b8"}} />
+                                <span className="font-medium">{g.title}</span>
+                              </div>
+                              <span className={done?"text-emerald-700":"text-rose-700"}>{pct}%</span>
+                            </div>
+                            <Progress value={pct} />
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="mt-6">
+                    <h3 className="text-base font-semibold">เปอร์เซ็นต์รายวัน</h3>
+                    <div className="mt-2 overflow-auto">
+                      <table className="min-w-[560px] w-full text-sm">
+                        <thead>
+                          <tr className="border-b bg-slate-50 text-left">
+                            <th className="px-3 py-2">วันที่</th>
+                            <th className="px-3 py-2">สำเร็จ/ทั้งหมด</th>
+                            <th className="px-3 py-2">เปอร์เซ็นต์</th>
+                            <th className="px-3 py-2">สถานะ</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {perDay.map(r=>(
+                            <tr key={r.date} className="border-b">
+                              <td className="px-3 py-2">{fmtThai(r.date)}</td>
+                              <td className="px-3 py-2">{r.ok}/{r.total}</td>
+                              <td className="px-3 py-2">{r.pct}%</td>
+                              <td className="px-3 py-2">{r.pct===100 ? "✅ สำเร็จทั้งหมด" : "❌ ยังไม่ครบ"}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </section>
+          </main>
+
+          <footer className="mx-auto max-w-7xl px-4 py-6 text-center text-xs text-slate-500">
+            ข้อมูลทั้งหมดเก็บในอุปกรณ์คุณผ่าน IndexedDB (สำรองด้วย “ส่งออก JSON” ได้ตลอด) — แอปนี้ฝังลง Notion ได้
+          </footer>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
